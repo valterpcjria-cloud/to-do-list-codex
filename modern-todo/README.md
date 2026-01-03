@@ -14,3 +14,20 @@ The React Compiler is not enabled on this template because of its impact on dev 
 ## Expanding the ESLint configuration
 
 If you are developing a production application, we recommend using TypeScript with type-aware lint rules enabled. Check out the [TS template](https://github.com/vitejs/vite/tree/main/packages/create-vite/template-react-ts) for information on how to integrate TypeScript and [`typescript-eslint`](https://typescript-eslint.io) in your project.
+
+## Nexus CRM (dev)
+
+Em um terminal:
+
+- `npm run server` (API local em `http://localhost:8787`)
+
+Em outro terminal:
+
+- `npm run dev` (Vite em `http://localhost:5173`)
+
+### WhatsApp via Evolution API
+
+- No CRM: `Agente IA` → `WhatsApp` → `Conectar` → selecione `Evolution API` e preencha `URL`, `API Key` e `Instância`.
+- Clique em `Gerar QR` e leia o QR com o WhatsApp.
+- Webhook (inbound): configure na Evolution para chamar `http://localhost:8787/api/evolution/webhook`.
+  - Se você definir `EVOLUTION_WEBHOOK_TOKEN`, inclua `?token=SEU_TOKEN` na URL (ou envie o header `x-webhook-token`).
