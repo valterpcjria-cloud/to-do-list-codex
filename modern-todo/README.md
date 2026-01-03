@@ -31,3 +31,12 @@ Em outro terminal:
 - Clique em `Gerar QR` e leia o QR com o WhatsApp.
 - Webhook (inbound): configure na Evolution para chamar `http://localhost:8787/api/evolution/webhook`.
   - Se você definir `EVOLUTION_WEBHOOK_TOKEN`, inclua `?token=SEU_TOKEN` na URL (ou envie o header `x-webhook-token`).
+
+### Supabase (persistência do CRM)
+
+- Rode o SQL em `modern-todo/supabase/schema.sql` no Supabase SQL Editor.
+- Configure `.env` com `VITE_SUPABASE_URL` e `VITE_SUPABASE_ANON_KEY`.
+- Login (produção): `VITE_REQUIRE_LOGIN=true` (workspace = `auth.uid()`).
+- O CRM sincroniza automaticamente os estados (leads, pipeline, etc.) com a tabela `crm_kv`.
+- Produção (RLS): rode `modern-todo/supabase/production.sql` após o schema.
+- Limpar banco: rode `modern-todo/supabase/reset.sql`.

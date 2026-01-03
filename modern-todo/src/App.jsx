@@ -1,5 +1,6 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react'
 import './App.css'
+import { DEFAULT_WORKSPACE, SUPABASE_KV_TABLE, clearWorkspace, supabase, supabaseConfigured } from './supabase'
 
 const LEADS_STORAGE_KEY = 'nexus-crm-leads-v1'
 const DEALS_STORAGE_KEY = 'nexus-crm-deals-v1'
@@ -9,25 +10,129 @@ const TASKS_STORAGE_KEY = 'nexus-crm-tasks-v1'
 const AUTOMATIONS_STORAGE_KEY = 'nexus-crm-automations-v1'
 const AI_AGENT_STORAGE_KEY = 'nexus-crm-ai-agent-v1'
 
+const DEMO_PROVIDER_ENABLED = import.meta.env.DEV || import.meta.env.VITE_ENABLE_DEMO_PROVIDER === 'true'
+
+const WorkspaceContext = createContext(DEFAULT_WORKSPACE)
+
+function useWorkspace() {
+  return useContext(WorkspaceContext)
+}
+
 function useLocalStorageState(key, initialValue) {
-  const [state, setState] = useState(() => {
-    if (typeof window === 'undefined') return typeof initialValue === 'function' ? initialValue() : initialValue
+  const workspace = useWorkspace()
+  const storageKey = `${key}:${workspace}`
+  const initialRef = useRef(initialValue)
+  initialRef.current = initialValue
+  const supabaseWarnedRef = useRef(false)
+  const skipSupabaseSyncRef = useRef(true)
+
+  const getDefaultValue = () => {
+    const init = initialRef.current
+    return typeof init === 'function' ? init() : init
+  }
+
+  const readLocal = () => {
+    if (typeof window === 'undefined') return getDefaultValue()
     try {
-      const raw = window.localStorage.getItem(key)
+      const raw = window.localStorage.getItem(storageKey)
       if (raw) return JSON.parse(raw)
+      if (workspace === DEFAULT_WORKSPACE) {
+        const legacy = window.localStorage.getItem(key)
+        if (legacy) return JSON.parse(legacy)
+      }
     } catch {
       // ignore parse errors
     }
-    return typeof initialValue === 'function' ? initialValue() : initialValue
-  })
+    return getDefaultValue()
+  }
+
+  const [state, setState] = useState(readLocal)
+  const stateRef = useRef(state)
+
+  useEffect(() => {
+    stateRef.current = state
+  }, [state])
+
+  useEffect(() => {
+    setState(readLocal())
+    skipSupabaseSyncRef.current = true
+  }, [storageKey])
 
   useEffect(() => {
     try {
-      window.localStorage.setItem(key, JSON.stringify(state))
+      window.localStorage.setItem(storageKey, JSON.stringify(state))
     } catch {
       // ignore quota errors
     }
-  }, [key, state])
+  }, [storageKey, state])
+
+  useEffect(() => {
+    if (!supabaseConfigured || !supabase) return
+
+    let cancelled = false
+
+    const warnOnce = (error) => {
+      if (supabaseWarnedRef.current) return
+      supabaseWarnedRef.current = true
+      console.warn('[supabase] sync desativado por erro:', error)
+    }
+
+    ;(async () => {
+      try {
+        const { data, error } = await supabase
+          .from(SUPABASE_KV_TABLE)
+          .select('value')
+          .eq('workspace', workspace)
+          .eq('key', key)
+          .maybeSingle()
+
+        if (cancelled) return
+        if (error) {
+          warnOnce(error)
+          return
+        }
+
+        if (data?.value !== undefined && data?.value !== null) {
+          setState(data.value)
+        }
+      } catch (err) {
+        warnOnce(err)
+      }
+    })()
+
+    return () => {
+      cancelled = true
+    }
+  }, [key, workspace])
+
+  useEffect(() => {
+    if (!supabaseConfigured || !supabase) return
+    if (supabaseWarnedRef.current) return
+    if (skipSupabaseSyncRef.current) {
+      skipSupabaseSyncRef.current = false
+      return
+    }
+
+    const timer = setTimeout(async () => {
+      try {
+        await supabase.from(SUPABASE_KV_TABLE).upsert(
+          {
+            workspace,
+            key,
+            value: stateRef.current,
+            updated_at: new Date().toISOString(),
+          },
+          { onConflict: 'workspace,key' },
+        )
+      } catch (err) {
+        if (supabaseWarnedRef.current) return
+        supabaseWarnedRef.current = true
+        console.warn('[supabase] sync desativado por erro:', err)
+      }
+    }, 500)
+
+    return () => clearTimeout(timer)
+  }, [key, state, workspace])
 
   const reset = () => setState(typeof initialValue === 'function' ? initialValue() : initialValue)
 
@@ -563,6 +668,24 @@ const Icon = {
       <path d="M10 11v6M14 11v6" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
     </svg>
   ),
+  LogOut: (props) => (
+    <svg viewBox="0 0 24 24" fill="none" aria-hidden="true" {...props}>
+      <path
+        d="M10 7H6a2 2 0 0 0-2 2v6a2 2 0 0 0 2 2h4"
+        stroke="currentColor"
+        strokeWidth="1.8"
+        strokeLinejoin="round"
+      />
+      <path
+        d="M14 7 19 12l-5 5"
+        stroke="currentColor"
+        strokeWidth="1.8"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+      <path d="M19 12H10" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
+    </svg>
+  ),
 }
 
 const NAV_ITEMS = [
@@ -593,6 +716,7 @@ const PIPELINE_STAGES = [
   { id: 'contract', label: 'Contrato', dot: '#06b6d4', tint: 'teal' },
 ]
 
+/*
 const demoData = {
   kpis: [
     {
@@ -979,25 +1103,26 @@ const demoData = {
     },
   ],
 }
+*/
 
 function useStoredLeads() {
-  return useLocalStorageState(LEADS_STORAGE_KEY, () => demoData.leadsKanban)
+  return useLocalStorageState(LEADS_STORAGE_KEY, () => [])
 }
 
 function useStoredDeals() {
-  return useLocalStorageState(DEALS_STORAGE_KEY, () => demoData.pipelineDeals)
+  return useLocalStorageState(DEALS_STORAGE_KEY, () => [])
 }
 
 function useStoredContacts() {
-  return useLocalStorageState(CONTACTS_STORAGE_KEY, () => demoData.contacts)
+  return useLocalStorageState(CONTACTS_STORAGE_KEY, () => [])
 }
 
 function useStoredCompanies() {
-  return useLocalStorageState(COMPANIES_STORAGE_KEY, () => demoData.companies)
+  return useLocalStorageState(COMPANIES_STORAGE_KEY, () => [])
 }
 
 function useStoredTasks() {
-  return useLocalStorageState(TASKS_STORAGE_KEY, () => demoData.tasks)
+  return useLocalStorageState(TASKS_STORAGE_KEY, () => [])
 }
 
 function useStoredAutomations() {
@@ -1030,7 +1155,12 @@ function Chip({ children, variant = 'neutral' }) {
   return <span className={`chip ${variant}`}>{children}</span>
 }
 
-function Sidebar({ activeId, onSelect }) {
+function Sidebar({ activeId, onSelect, user, onSignOut }) {
+  const userEmail = user?.email ?? ''
+  const userMeta = user?.user_metadata ?? {}
+  const userName = userMeta.full_name || userMeta.name || (userEmail ? userEmail.split('@')[0] : 'Conta')
+  const avatarLabel = userName ? initialsFromName(String(userName)) : userEmail.slice(0, 2).toUpperCase()
+
   return (
     <aside className="sidebar">
       <div className="brand">
@@ -1065,26 +1195,145 @@ function Sidebar({ activeId, onSelect }) {
 
       <div className="sidebar-footer">
         <div className="user-pill">
-          <div className="avatar">VJ</div>
+          <div className="avatar">{avatarLabel || '—'}</div>
           <div className="user-meta">
-            <div className="user-name">Valter Junior PRO</div>
-            <div className="user-email">valterpjrpro@gmail.com</div>
+            <div className="user-name">{userName}</div>
+            <div className="user-email">{userEmail}</div>
           </div>
+          {typeof onSignOut === 'function' ? (
+            <button type="button" className="user-signout" onClick={() => onSignOut()} aria-label="Sair">
+              <Icon.LogOut className="svg sm" />
+            </button>
+          ) : null}
         </div>
       </div>
     </aside>
   )
 }
 
-function DashboardPage() {
-  const leads = useMemo(
-    () =>
-      demoData.leads.map((lead) => ({
-        ...lead,
-        initials: initialsFromName(lead.name),
-      })),
+function DashboardPage({ onNavigate }) {
+  const [storedLeads] = useStoredLeads()
+  const [storedDeals] = useStoredDeals()
+  const [storedTasks] = useStoredTasks()
+
+  const pipelineTotal = useMemo(
+    () => (storedDeals ?? []).reduce((acc, deal) => acc + (Number(deal.amount) || 0), 0),
+    [storedDeals],
+  )
+
+  const dealsWon = useMemo(
+    () => (storedDeals ?? []).filter((deal) => deal.stageId === 'won' || deal.stageId === 'contract'),
+    [storedDeals],
+  )
+  const closedRevenue = useMemo(
+    () => dealsWon.reduce((acc, deal) => acc + (Number(deal.amount) || 0), 0),
+    [dealsWon],
+  )
+
+  const pendingTasks = useMemo(() => (storedTasks ?? []).filter((task) => !task.done), [storedTasks])
+
+  const kpis = useMemo(
+    () => [
+      {
+        label: 'Total de leads',
+        value: String((storedLeads ?? []).length),
+        trend: '0%',
+        trendHint: 'vs último período',
+        icon: Icon.Users,
+        color: '#2563eb',
+      },
+      {
+        label: 'Pipeline total',
+        value: formatCurrency(pipelineTotal),
+        trend: '0%',
+        trendHint: 'vs último período',
+        icon: Icon.Dollar,
+        color: '#16a34a',
+      },
+      {
+        label: 'Negócios ganhos',
+        value: formatCurrency(closedRevenue),
+        trend: '0%',
+        trendHint: 'vs último período',
+        icon: Icon.Trophy,
+        color: '#a855f7',
+      },
+      {
+        label: 'Tarefas pendentes',
+        value: String(pendingTasks.length),
+        trend: '0%',
+        trendHint: 'vs último período',
+        icon: Icon.Clipboard,
+        color: '#f97316',
+      },
+    ],
+    [closedRevenue, pendingTasks.length, pipelineTotal, storedLeads],
+  )
+
+  const quickActions = useMemo(
+    () => [
+      { id: 'new-lead', label: 'Novo Lead', icon: Icon.Users, color: '#2563eb', nav: 'leads' },
+      { id: 'new-contact', label: 'Novo Contato', icon: Icon.Chat, color: '#10b981', nav: 'contacts' },
+      { id: 'new-company', label: 'Nova Empresa', icon: Icon.Clipboard, color: '#a855f7', nav: 'companies' },
+      { id: 'new-deal', label: 'Novo Negócio', icon: Icon.Dollar, color: '#f97316', nav: 'pipeline' },
+      { id: 'new-task', label: 'Nova Tarefa', icon: Icon.Clipboard, color: '#ec4899', nav: 'tasks' },
+      { id: 'ai', label: 'Agente IA', icon: Icon.Spark, color: '#0ea5e9', nav: 'ai' },
+    ],
     [],
   )
+
+  const leads = useMemo(() => {
+    const list = Array.isArray(storedLeads) ? storedLeads : []
+    return list.slice(0, 6).map((lead) => {
+      const stage = LEAD_STAGES.find((item) => item.id === lead.stageId)
+      const status = stage?.label ?? 'Lead'
+      const chipVariant =
+        lead.stageId === 'qualified'
+          ? 'purple'
+          : lead.stageId === 'contacted' || lead.stageId === 'negotiation'
+            ? 'amber'
+            : 'blue'
+
+      return {
+        ...lead,
+        initials: initialsFromName(lead.name || 'Lead'),
+        status,
+        chipVariant,
+        channels: lead.origin ? [originLabel(lead.origin)] : [],
+        value: Number(lead.value) || 0,
+      }
+    })
+  }, [storedLeads])
+
+  const funnel = useMemo(() => {
+    const counts = Object.fromEntries(LEAD_STAGES.map((stage) => [stage.id, { count: 0, amount: 0 }]))
+    ;(storedLeads ?? []).forEach((lead) => {
+      const bucket = counts[lead.stageId]
+      if (!bucket) return
+      bucket.count += 1
+      bucket.amount += Number(lead.value) || 0
+    })
+
+    return LEAD_STAGES.map((stage) => ({
+      label: stage.label,
+      color: stage.dot,
+      count: counts[stage.id]?.count ?? 0,
+      amount: counts[stage.id]?.amount ?? 0,
+    }))
+  }, [storedLeads])
+
+  const activities = useMemo(() => {
+    const list = Array.isArray(storedTasks) ? storedTasks : []
+    const colors = { high: '#ef4444', urgent: '#ef4444', medium: '#f59e0b', low: '#2563eb' }
+    return list.slice(0, 6).map((task) => ({
+      id: task.id,
+      title: task.title,
+      tag: task.type || 'tarefa',
+      meta: task.note || task.related || '',
+      when: task.dueLabel || '',
+      dot: colors[task.priority] ?? '#0ea5e9',
+    }))
+  }, [storedTasks])
 
   return (
     <div className="page">
@@ -1094,11 +1343,11 @@ function DashboardPage() {
           <p className="subtitle">Visão geral do seu CRM</p>
         </div>
         <div className="page-actions">
-          <button type="button" className="btn ghost">
+          <button type="button" className="btn ghost" onClick={() => onNavigate?.('dashboard')}>
             <Icon.Refresh className="svg" />
             Atualizar
           </button>
-          <button type="button" className="btn primary">
+          <button type="button" className="btn primary" onClick={() => onNavigate?.('ai')}>
             <Icon.Spark className="svg" />
             Agente IA
           </button>
@@ -1106,7 +1355,7 @@ function DashboardPage() {
       </header>
 
       <section className="kpi-grid" aria-label="Indicadores">
-        {demoData.kpis.map((kpi) => {
+        {kpis.map((kpi) => {
           const KpiIcon = kpi.icon
           return (
             <article key={kpi.label} className="card kpi">
@@ -1131,10 +1380,10 @@ function DashboardPage() {
           <h2>Ações Rápidas</h2>
         </div>
         <div className="quick-grid">
-          {demoData.quickActions.map((action) => {
+          {quickActions.map((action) => {
             const ActionIcon = action.icon
             return (
-              <button key={action.id} type="button" className="quick-item">
+              <button key={action.id} type="button" className="quick-item" onClick={() => onNavigate?.(action.nav)}>
                 <span className="quick-icon" style={{ backgroundColor: action.color }} aria-hidden="true">
                   <ActionIcon className="svg" />
                 </span>
@@ -1149,20 +1398,25 @@ function DashboardPage() {
         <div className="card leads">
           <div className="card-head between">
             <h2>Últimos Leads</h2>
-            <button type="button" className="btn small">
+            <button type="button" className="btn small" onClick={() => onNavigate?.('leads')}>
               + Novo
             </button>
           </div>
 
           <div className="lead-list" role="list">
-            {leads.map((lead) => (
+            {leads.length === 0 ? (
+              <div className="placeholder">
+                <p>Nenhum lead ainda. Crie seu primeiro lead para começar.</p>
+              </div>
+            ) : (
+              leads.map((lead) => (
               <article key={lead.id} className="lead" role="listitem">
                 <div className="lead-left">
                   <div className="avatar lead-avatar">{lead.initials}</div>
                   <div className="lead-meta">
                     <div className="lead-row">
                       <div className="lead-name">{lead.name}</div>
-                      <Chip variant={lead.status === 'Qualificado' ? 'purple' : 'blue'}>
+                      <Chip variant={lead.chipVariant}>
                         {lead.status}
                       </Chip>
                       {typeof lead.score === 'number' && <Chip variant="amber">★ {lead.score}</Chip>}
@@ -1190,7 +1444,7 @@ function DashboardPage() {
                 </div>
                 <div className="lead-when">{lead.lastTouch}</div>
               </article>
-            ))}
+            )))}
           </div>
         </div>
 
@@ -1200,7 +1454,7 @@ function DashboardPage() {
               <h2>Funil de Vendas</h2>
             </div>
             <div className="funnel-list" role="list">
-              {demoData.funnel.map((stage) => (
+              {funnel.map((stage) => (
                 <div key={stage.label} className="funnel-row" role="listitem">
                   <div className="funnel-left">
                     <span className="dot" style={{ backgroundColor: stage.color }} aria-hidden="true" />
@@ -1220,7 +1474,12 @@ function DashboardPage() {
               <h2>Atividades Recentes</h2>
             </div>
             <div className="activity-list" role="list">
-              {demoData.activities.map((activity) => (
+              {activities.length === 0 ? (
+                <div className="placeholder">
+                  <p>Sem atividades recentes.</p>
+                </div>
+              ) : (
+                activities.map((activity) => (
                 <article key={activity.id} className="activity-row" role="listitem">
                   <div
                     className="activity-dot"
@@ -1236,7 +1495,7 @@ function DashboardPage() {
                   </div>
                   <div className="activity-when">{activity.when}</div>
                 </article>
-              ))}
+              )))}
             </div>
           </div>
         </div>
@@ -3843,15 +4102,22 @@ function ReportsPage() {
   const [tab, setTab] = useState('funnel') // funnel | origins | activities | roi
 
   const [storedLeads] = useStoredLeads()
+  const [storedDeals] = useStoredDeals()
   const leadCount = storedLeads.length
 
   const pipelineSummary = useMemo(() => {
-    const total = demoData.pipelineDeals.reduce((acc, deal) => acc + (Number(deal.amount) || 0), 0)
-    const avg = demoData.pipelineDeals.length ? Math.round(total / demoData.pipelineDeals.length) : 0
+    const deals = Array.isArray(storedDeals) ? storedDeals : []
+    const total = deals.reduce((acc, deal) => acc + (Number(deal.amount) || 0), 0)
+    const avg = deals.length ? Math.round(total / deals.length) : 0
     return { total, avg }
-  }, [])
+  }, [storedDeals])
 
-  const closed = useMemo(() => ({ deals: 0, revenue: 0 }), [])
+  const closed = useMemo(() => {
+    const deals = Array.isArray(storedDeals) ? storedDeals : []
+    const won = deals.filter((deal) => deal.stageId === 'won' || deal.stageId === 'contract')
+    const revenue = won.reduce((acc, deal) => acc + (Number(deal.amount) || 0), 0)
+    return { deals: won.length, revenue }
+  }, [storedDeals])
   const conversion = leadCount ? ((closed.deals / leadCount) * 100).toFixed(1) : '0.0'
 
   const kpis = useMemo(
@@ -3926,21 +4192,17 @@ function ReportsPage() {
     }))
   }, [funnelPalette, storedLeads])
 
-  const funnelScaleMax = 2
+  const funnelScaleMax = Math.max(2, ...funnelRows.map((row) => row.count))
   const funnelTicks = useMemo(() => ['0', '0.5', '1', '1.5', '2'], [])
 
   const lineSeries = useMemo(
     () => [
-      { label: '31/10', value: 0 },
-      { label: '03/11', value: 0 },
-      { label: '06/11', value: 0 },
-      { label: '09/11', value: 0 },
-      { label: '12/11', value: 0 },
-      { label: '15/11', value: 0 },
-      { label: '18/11', value: 0 },
-      { label: '21/11', value: 0 },
-      { label: '24/11', value: 5 },
-      { label: '28/11', value: 2 },
+      ...Array.from({ length: 10 }).map((_, index) => {
+        const date = new Date()
+        date.setDate(date.getDate() - (9 - index))
+        const label = date.toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit' })
+        return { label, value: 0 }
+      }),
     ],
     [],
   )
@@ -3956,7 +4218,7 @@ function ReportsPage() {
 
   const pipelineStageStats = useMemo(() => {
     const grouped = Object.fromEntries(pipelineStages.map((stage) => [stage.id, { deals: 0, value: 0 }]))
-    demoData.pipelineDeals.forEach((deal) => {
+    ;(storedDeals ?? []).forEach((deal) => {
       const bucket = grouped[deal.stageId]
       if (!bucket) return
       bucket.deals += 1
@@ -3968,7 +4230,7 @@ function ReportsPage() {
       deals: grouped[stage.id]?.deals ?? 0,
       value: grouped[stage.id]?.value ?? 0,
     }))
-  }, [pipelineStages])
+  }, [pipelineStages, storedDeals])
 
   const dealMax = Math.max(2, ...pipelineStageStats.map((stage) => stage.deals))
   const valueStep = 65000
@@ -3990,7 +4252,7 @@ function ReportsPage() {
     const viewWidth = 420
     const viewHeight = 250
     const pad = { left: 44, right: 16, top: 16, bottom: 42 }
-    const maxY = 8
+    const maxY = Math.max(8, ...lineSeries.map((point) => point.value))
 
     const chartW = viewWidth - pad.left - pad.right
     const chartH = viewHeight - pad.top - pad.bottom
@@ -4233,6 +4495,12 @@ function AgentConnectModal({ open, channel, meta, connection, onClose, onSave, o
   const isConnected = Boolean(connection?.connected)
   const ToneIcon = meta?.icon ?? Icon.Spark
   const isWhatsapp = channel === 'whatsapp'
+  const providerDefault = isWhatsapp ? (DEMO_PROVIDER_ENABLED ? 'demo' : 'evolution') : 'manual'
+  const providerFromConnection = connection?.provider
+  const providerValue =
+    providerFromConnection && (providerFromConnection !== 'demo' || DEMO_PROVIDER_ENABLED)
+      ? providerFromConnection
+      : providerDefault
 
   const labelMap = {
     whatsapp: 'Número do WhatsApp Business',
@@ -4262,7 +4530,7 @@ function AgentConnectModal({ open, channel, meta, connection, onClose, onSave, o
   }))
 
   const [form, setForm] = useState(() => ({
-    provider: connection?.provider ?? 'demo',
+    provider: providerValue,
     account: connection?.account ?? '',
     evolution: {
       baseUrl: connection?.evolution?.baseUrl ?? '',
@@ -4284,7 +4552,7 @@ function AgentConnectModal({ open, channel, meta, connection, onClose, onSave, o
       qr: '',
     })
     setForm({
-      provider: connection?.provider ?? 'demo',
+      provider: providerValue,
       account: connection?.account ?? '',
       evolution: {
         baseUrl: connection?.evolution?.baseUrl ?? '',
@@ -4313,7 +4581,8 @@ function AgentConnectModal({ open, channel, meta, connection, onClose, onSave, o
   const placeholder = placeholderMap[channel] ?? ''
   const submitTone = toneButtonMap[meta?.tone] ?? 'primary'
 
-  const provider = isWhatsapp ? (form.provider ?? 'demo') : 'demo'
+  const provider = isWhatsapp ? (form.provider ?? providerDefault) : providerDefault
+  const providerLabel = provider === 'evolution' ? 'Evolution API' : provider === 'demo' ? 'Teste' : 'Manual'
   const evolutionEnabled = isWhatsapp && provider === 'evolution'
   const canSubmit =
     provider === 'evolution'
@@ -4405,7 +4674,7 @@ function AgentConnectModal({ open, channel, meta, connection, onClose, onSave, o
 
     const account = form.account.trim()
     if (!account) return
-    onSave?.({ connected: true, provider: 'demo', account, connectedAt: Date.now() })
+    onSave?.({ connected: true, provider, account, connectedAt: Date.now() })
   }
 
   const handleDisconnect = () => {
@@ -4421,7 +4690,7 @@ function AgentConnectModal({ open, channel, meta, connection, onClose, onSave, o
           <div className="modal-title">
             <h2>{isConnected ? 'Configurar canal' : 'Conectar canal'}</h2>
             <p className="modal-subtitle">
-              {meta?.label ?? 'Canal'} • modo demo (simulado) • o lead já é registrado no CRM pelo chat de teste
+              {meta?.label ?? 'Canal'} • {providerLabel} • {isConnected ? 'conectado' : 'não conectado'}
             </p>
           </div>
           <button type="button" className="btn icon modal-close" aria-label="Fechar" onClick={() => onClose?.()}>
@@ -4452,7 +4721,7 @@ function AgentConnectModal({ open, channel, meta, connection, onClose, onSave, o
                     value={form.provider}
                     onChange={(event) => setForm((prev) => ({ ...prev, provider: event.target.value }))}
                   >
-                    <option value="demo">Demo (simulado)</option>
+                    {DEMO_PROVIDER_ENABLED ? <option value="demo">Teste (local)</option> : null}
                     <option value="evolution">Evolution API</option>
                   </select>
                 </label>
@@ -4796,8 +5065,8 @@ function agentBuildReply({ channelLabel, connected, createdLead, createdDeal, cr
 
   if (createdDeal) lines.push('Também criei um negócio no Pipeline para acompanhar este atendimento.')
   if (createdTasks) lines.push('Criei uma tarefa de follow-up para o time comercial.')
-  if (triggeredAutomations) lines.push('Iniciei automações de marketing (modo demo) para este lead.')
-  if (!connected) lines.push('Obs: este canal ainda não está conectado (modo demo), mas o fluxo no CRM está funcionando.')
+  if (triggeredAutomations) lines.push('Iniciei automações de marketing para este lead.')
+  if (!connected) lines.push('Obs: este canal ainda não está conectado. Ao conectar, as mensagens entram automaticamente no CRM.')
 
   if (questions.length) {
     lines.push(questions.slice(0, 2).join(' '))
@@ -5721,37 +5990,395 @@ function PlaceholderPage({ title }) {
   )
 }
 
+function FullPageLoader({ title = 'Carregando' }) {
+  return (
+    <div className="auth-root">
+      <div className="auth-shell single">
+        <section className="auth-card">
+          <div className="auth-card-head">
+            <div className="brand">
+              <div className="brand-logo" aria-hidden="true">
+                <Icon.Bolt className="svg" />
+              </div>
+              <div className="brand-text">
+                <div className="brand-title">CRM Pro</div>
+                <div className="brand-sub">Preparando seu workspace</div>
+              </div>
+            </div>
+          </div>
+          <div className="auth-loading">
+            <div className="auth-spinner" aria-hidden="true" />
+            <div className="auth-loading-text">{title}</div>
+          </div>
+        </section>
+      </div>
+    </div>
+  )
+}
+
+function SupabaseSetupPage() {
+  return (
+    <div className="auth-root">
+      <div className="auth-shell single">
+        <section className="auth-card">
+          <div className="auth-card-head">
+            <div className="brand">
+              <div className="brand-logo" aria-hidden="true">
+                <Icon.Bolt className="svg" />
+              </div>
+              <div className="brand-text">
+                <div className="brand-title">CRM Pro</div>
+                <div className="brand-sub">Configuração necessária</div>
+              </div>
+            </div>
+          </div>
+
+          <div className="auth-alert error">
+            Para habilitar o login e sincronização, configure `VITE_SUPABASE_URL` e `VITE_SUPABASE_ANON_KEY` no arquivo
+            `.env`.
+          </div>
+
+          <div className="auth-setup">
+            <div className="auth-setup-title">Passos</div>
+            <ol className="auth-setup-steps">
+              <li>Rode o SQL em `modern-todo/supabase/schema.sql` no Supabase</li>
+              <li>Copie `modern-todo/.env.example` para `modern-todo/.env`</li>
+              <li>Preencha as variáveis do Supabase</li>
+            </ol>
+          </div>
+        </section>
+      </div>
+    </div>
+  )
+}
+
+function AuthPage() {
+  const [mode, setMode] = useState('sign-in') // sign-in | sign-up | magic
+  const [name, setName] = useState('')
+  const [email, setEmail] = useState('')
+  const [password, setPassword] = useState('')
+  const [confirm, setConfirm] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+  const [info, setInfo] = useState('')
+
+  const normalizedEmail = email.trim().toLowerCase()
+  const passwordOk = mode === 'magic' ? true : password.trim().length >= 6
+  const confirmOk = mode !== 'sign-up' ? true : confirm === password
+  const canSubmit = Boolean(normalizedEmail) && passwordOk && confirmOk && !busy
+
+  const submitLabel = mode === 'sign-up' ? 'Criar conta' : mode === 'magic' ? 'Enviar link mágico' : 'Entrar'
+
+  const handleSubmit = async (event) => {
+    event.preventDefault()
+    if (!supabaseConfigured || !supabase) return
+    if (!canSubmit) return
+
+    setBusy(true)
+    setError('')
+    setInfo('')
+
+    try {
+      if (mode === 'magic') {
+        const { error: otpError } = await supabase.auth.signInWithOtp({
+          email: normalizedEmail,
+          options: { emailRedirectTo: window.location.origin },
+        })
+        if (otpError) throw otpError
+        setInfo('Link enviado! Verifique seu e-mail para entrar.')
+        return
+      }
+
+      if (mode === 'sign-up') {
+        if (password !== confirm) {
+          setError('As senhas não conferem.')
+          return
+        }
+
+        const { data, error: signUpError } = await supabase.auth.signUp({
+          email: normalizedEmail,
+          password,
+          options: { data: { full_name: name.trim() || undefined } },
+        })
+        if (signUpError) throw signUpError
+        if (!data.session) {
+          setInfo('Conta criada! Confirme seu e-mail para ativar o acesso.')
+        }
+        return
+      }
+
+      const { error: signInError } = await supabase.auth.signInWithPassword({
+        email: normalizedEmail,
+        password,
+      })
+      if (signInError) throw signInError
+    } catch (err) {
+      setError(err?.message ? String(err.message) : 'Não foi possível autenticar.')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  if (!supabaseConfigured || !supabase) return <SupabaseSetupPage />
+
+  return (
+    <div className="auth-root">
+      <div className="auth-shell">
+        <section className="auth-hero">
+          <div className="auth-hero-top">
+            <div className="brand">
+              <div className="brand-logo" aria-hidden="true">
+                <Icon.Bolt className="svg" />
+              </div>
+              <div className="brand-text">
+                <div className="brand-title">Nexus CRM Pro</div>
+                <div className="brand-sub">CRM imobiliário, feito para conversas</div>
+              </div>
+            </div>
+          </div>
+
+          <h1 className="auth-headline">Venda com contexto. Atenda com velocidade.</h1>
+          <p className="auth-copy">
+            Leads, pipeline, tarefas e automações em um só lugar — com integração multicanal via WhatsApp, Instagram e
+            Facebook.
+          </p>
+
+          <div className="auth-features" aria-label="Destaques do CRM">
+            <div className="auth-feature">
+              <span className="auth-feature-icon" aria-hidden="true">
+                <Icon.Dollar className="svg sm" />
+              </span>
+              Pipeline com drag & drop
+            </div>
+            <div className="auth-feature">
+              <span className="auth-feature-icon" aria-hidden="true">
+                <Icon.Users className="svg sm" />
+              </span>
+              Leads + contatos unificados
+            </div>
+            <div className="auth-feature">
+              <span className="auth-feature-icon" aria-hidden="true">
+                <Icon.Clipboard className="svg sm" />
+              </span>
+              Tarefas com prioridades
+            </div>
+            <div className="auth-feature">
+              <span className="auth-feature-icon" aria-hidden="true">
+                <Icon.Spark className="svg sm" />
+              </span>
+              Agente IA multicanal
+            </div>
+          </div>
+
+          <div className="auth-hero-foot">
+            <div className="auth-hero-note">
+              Seus dados são isolados por workspace (usuário) no Supabase — pronto para produção.
+            </div>
+          </div>
+        </section>
+
+        <section className="auth-card">
+          <div className="auth-card-head">
+            <h2>Acesse o CRM</h2>
+            <p className="subtitle">Entre com sua conta para começar</p>
+          </div>
+
+          <div className="auth-tabs" role="tablist" aria-label="Método de acesso">
+            <button
+              type="button"
+              className={mode === 'sign-in' ? 'auth-tab active' : 'auth-tab'}
+              onClick={() => setMode('sign-in')}
+              role="tab"
+              aria-selected={mode === 'sign-in'}
+            >
+              Entrar
+            </button>
+            <button
+              type="button"
+              className={mode === 'sign-up' ? 'auth-tab active' : 'auth-tab'}
+              onClick={() => setMode('sign-up')}
+              role="tab"
+              aria-selected={mode === 'sign-up'}
+            >
+              Criar conta
+            </button>
+            <button
+              type="button"
+              className={mode === 'magic' ? 'auth-tab active' : 'auth-tab'}
+              onClick={() => setMode('magic')}
+              role="tab"
+              aria-selected={mode === 'magic'}
+            >
+              Link mágico
+            </button>
+          </div>
+
+          {error ? <div className="auth-alert error">{error}</div> : null}
+          {info ? <div className="auth-alert info">{info}</div> : null}
+
+          <form className="auth-form" onSubmit={handleSubmit}>
+            {mode === 'sign-up' ? (
+              <label className="form-field">
+                <span className="form-label">Nome (opcional)</span>
+                <input
+                  className="form-control"
+                  value={name}
+                  onChange={(event) => setName(event.target.value)}
+                  placeholder="Como podemos te chamar?"
+                  autoComplete="name"
+                />
+              </label>
+            ) : null}
+
+            <label className="form-field">
+              <span className="form-label">E-mail</span>
+              <input
+                className="form-control"
+                type="email"
+                value={email}
+                onChange={(event) => setEmail(event.target.value)}
+                placeholder="seuemail@dominio.com"
+                autoComplete="email"
+                required
+              />
+            </label>
+
+            {mode !== 'magic' ? (
+              <label className="form-field">
+                <span className="form-label">Senha</span>
+                <input
+                  className="form-control"
+                  type="password"
+                  value={password}
+                  onChange={(event) => setPassword(event.target.value)}
+                  placeholder="Mínimo 6 caracteres"
+                  autoComplete={mode === 'sign-up' ? 'new-password' : 'current-password'}
+                  required
+                />
+              </label>
+            ) : null}
+
+            {mode === 'sign-up' ? (
+              <label className="form-field">
+                <span className="form-label">Confirmar senha</span>
+                <input
+                  className="form-control"
+                  type="password"
+                  value={confirm}
+                  onChange={(event) => setConfirm(event.target.value)}
+                  placeholder="Repita a senha"
+                  autoComplete="new-password"
+                  required
+                />
+              </label>
+            ) : null}
+
+            <button type="submit" className="btn primary auth-submit" disabled={!canSubmit}>
+              {busy ? 'Aguarde...' : submitLabel}
+            </button>
+
+            {mode === 'magic' ? (
+              <p className="auth-hint">Enviamos um link de acesso para seu e-mail. Abra no mesmo navegador.</p>
+            ) : (
+              <p className="auth-hint">Ao entrar, seu workspace é criado automaticamente a partir do seu usuário.</p>
+            )}
+          </form>
+        </section>
+      </div>
+    </div>
+  )
+}
+
+function useSupabaseSession() {
+  const [session, setSession] = useState(null)
+  const [loading, setLoading] = useState(Boolean(supabaseConfigured && supabase))
+
+  useEffect(() => {
+    if (!supabaseConfigured || !supabase) {
+      setLoading(false)
+      return
+    }
+
+    let cancelled = false
+
+    ;(async () => {
+      try {
+        const { data, error } = await supabase.auth.getSession()
+        if (cancelled) return
+        if (error) throw error
+        setSession(data.session)
+      } catch (err) {
+        console.warn('[supabase] falha ao obter sessão:', err)
+      } finally {
+        if (!cancelled) setLoading(false)
+      }
+    })()
+
+    const { data: listener } = supabase.auth.onAuthStateChange((_event, nextSession) => {
+      setSession(nextSession)
+    })
+
+    return () => {
+      cancelled = true
+      listener?.subscription?.unsubscribe()
+    }
+  }, [])
+
+  return { session, user: session?.user ?? null, loading }
+}
+
 function App() {
+  const requireLogin = import.meta.env.VITE_REQUIRE_LOGIN !== 'false'
+  const { session, user, loading } = useSupabaseSession()
   const [activeNav, setActiveNav] = useState('dashboard')
   const activeLabel = NAV_ITEMS.find((item) => item.id === activeNav)?.label ?? 'Dashboard'
 
-  return (
-    <div className="crm-root">
-      <Sidebar activeId={activeNav} onSelect={setActiveNav} />
+  const workspace = user?.id ? String(user.id) : DEFAULT_WORKSPACE
 
-      <main className="main" aria-label="Conteúdo">
-        {activeNav === 'dashboard' ? <DashboardPage /> : null}
-        {activeNav === 'leads' ? <LeadsPage /> : null}
-        {activeNav === 'pipeline' ? <PipelinePage /> : null}
-        {activeNav === 'contacts' ? <ContactsPage /> : null}
-        {activeNav === 'companies' ? <CompaniesPage /> : null}
-        {activeNav === 'tasks' ? <TasksPage /> : null}
-        {activeNav === 'marketing' ? <MarketingPage /> : null}
-        {activeNav === 'reports' ? <ReportsPage /> : null}
-        {activeNav === 'ai' ? <AiPage onClose={() => setActiveNav('dashboard')} /> : null}
-        {activeNav !== 'dashboard' &&
-        activeNav !== 'leads' &&
-        activeNav !== 'pipeline' &&
-        activeNav !== 'contacts' &&
-        activeNav !== 'companies' &&
-        activeNav !== 'tasks' &&
-        activeNav !== 'marketing' &&
-        activeNav !== 'reports' &&
-        activeNav !== 'ai' ? (
-          <PlaceholderPage title={activeLabel} />
-        ) : null}
-      </main>
-    </div>
+  const handleSignOut = useCallback(async () => {
+    if (!supabaseConfigured || !supabase) return
+    try {
+      await supabase.auth.signOut()
+    } finally {
+      clearWorkspace()
+    }
+  }, [])
+
+  if (requireLogin) {
+    if (!supabaseConfigured || !supabase) return <SupabaseSetupPage />
+    if (loading) return <FullPageLoader title="Carregando sua sessão..." />
+    if (!session) return <AuthPage />
+  }
+
+  return (
+    <WorkspaceContext.Provider value={workspace}>
+      <div className="crm-root">
+        <Sidebar activeId={activeNav} onSelect={setActiveNav} user={user} onSignOut={handleSignOut} />
+
+        <main className="main" aria-label="Conteúdo">
+          {activeNav === 'dashboard' ? <DashboardPage onNavigate={setActiveNav} /> : null}
+          {activeNav === 'leads' ? <LeadsPage /> : null}
+          {activeNav === 'pipeline' ? <PipelinePage /> : null}
+          {activeNav === 'contacts' ? <ContactsPage /> : null}
+          {activeNav === 'companies' ? <CompaniesPage /> : null}
+          {activeNav === 'tasks' ? <TasksPage /> : null}
+          {activeNav === 'marketing' ? <MarketingPage /> : null}
+          {activeNav === 'reports' ? <ReportsPage /> : null}
+          {activeNav === 'ai' ? <AiPage onClose={() => setActiveNav('dashboard')} /> : null}
+          {activeNav !== 'dashboard' &&
+          activeNav !== 'leads' &&
+          activeNav !== 'pipeline' &&
+          activeNav !== 'contacts' &&
+          activeNav !== 'companies' &&
+          activeNav !== 'tasks' &&
+          activeNav !== 'marketing' &&
+          activeNav !== 'reports' &&
+          activeNav !== 'ai' ? (
+            <PlaceholderPage title={activeLabel} />
+          ) : null}
+        </main>
+      </div>
+    </WorkspaceContext.Provider>
   )
 }
 
